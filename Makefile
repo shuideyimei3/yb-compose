@@ -72,3 +72,36 @@ bench-compare: up
 clean:
 	docker compose down -v 2>/dev/null || true
 	docker rm -f yb-latency-client- 2>/dev/null || true
+
+# Chaos Engineering
+# =================
+# 依赖: docker-compose.chaos.yaml + scripts/chaosctl
+# 用法: make chaos CMD="status"
+#       make chaos CMD="partition isolate region1"
+#       make chaos CMD="partition heal all"
+#       make chaos CMD="scenario run network-partition yb-1 20"
+
+CHAOS_COMPOSE = docker compose -f docker-compose.chaos.yaml
+
+chaos-build:
+	$(CHAOS_COMPOSE) build
+
+chaos:
+	@$(CHAOS_COMPOSE) run --rm chaosctl $(CMD)
+
+chaos-status:
+	@$(CHAOS_COMPOSE) run --rm chaosctl status
+
+chaos-partition:
+	@$(CHAOS_COMPOSE) run --rm chaosctl partition $(CMD)
+
+chaos-heal:
+	@$(CHAOS_COMPOSE) run --rm chaosctl partition heal $(CMD)
+
+chaos-delay:
+	@$(CHAOS_COMPOSE) run --rm chaosctl delay $(CMD)
+
+chaos-scenario:
+	@$(CHAOS_COMPOSE) run --rm chaosctl scenario run $(CMD)
+
+.PHONY: chaos chaos-status chaos-partition chaos-heal chaos-delay chaos-scenario

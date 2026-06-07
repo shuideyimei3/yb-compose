@@ -1,0 +1,655 @@
+#!/bin/bash
+#
+# chaosctl - YugabyteDB 混沌工程控制器 (单机 Docker 版)
+# =======================================================
+# 在单机 Docker 环境中模拟网络分区/延迟/故障等混沌场景，
+# 用于测试 YugabyteDB 在故障下的行为。
+#
+# 用法:
+#   chaosctl status                        查看集群网络状态
+#   chaosctl partition isolate <node>      完全隔离节点
+#   chaosctl partition isolate-input <node>  只能发不能收
+#   chaosctl partition isolate-output <node> 只能收不能发
+#   chaosctl partition heal [node]         恢复节点 (不指定=全部恢复)
+#   chaosctl delay set <node> <ms> [jitter] [loss%]
+#   chaosctl delay clear <node>
+#   chaosctl scenario list                 列出预设场景
+#   chaosctl scenario run <name>           运行预设场景
+#   chaosctl help                          显示帮助
+#
+# 节点名规则:
+#   yb-1 / region1 / yb-compose-yb-1 均指向同一节点
+#
+# ==================== 配置 ====================
+
+set -euo pipefail
+
+readonly COMPOSE_PROJECT="${COMPOSE_PROJECT_NAME:-yb-compose}"
+readonly NODES=(
+  "${COMPOSE_PROJECT}-yb-1"
+  "${COMPOSE_PROJECT}-yb-2"
+  "${COMPOSE_PROJECT}-yb-3"
+)
+readonly STATE_FILE="/tmp/chaosctl.state"
+
+# ==================== 工具函数 ====================
+
+# 解析节点名: yb-1 / region1 / yb-compose-yb-1 都行
+resolve_node() {
+  local name="$1"
+  case "$name" in
+    yb-compose-yb-1|yb-1|region1|node1) echo "${COMPOSE_PROJECT}-yb-1" ;;
+    yb-compose-yb-2|yb-2|region2|node2) echo "${COMPOSE_PROJECT}-yb-2" ;;
+    yb-compose-yb-3|yb-3|region3|node3) echo "${COMPOSE_PROJECT}-yb-3" ;;
+    *) echo "" ;;
+  esac
+}
+
+resolve_node_name() {
+  local node="$1"
+  case "$node" in
+    *yb-1) echo "region1" ;;
+    *yb-2) echo "region2" ;;
+    *yb-3) echo "region3" ;;
+    *) echo "$node" ;;
+  esac
+}
+
+# 在 yb 容器内执行命令 (返回 stdout)
+yb_exec() {
+  local node="$1"; shift
+  docker exec "$node" bash -c "$*" 2>/dev/null
+}
+
+# 检查容器运行状态
+node_is_running() {
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -qxF "$1"
+}
+
+# 获取其他节点列表
+other_nodes() {
+  local current="$1"
+  for n in "${NODES[@]}"; do
+    [ "$n" != "$current" ] && echo "$n"
+  done
+}
+
+# 获取其他节点的 IP 列表 (空格分隔)
+other_node_ips() {
+  local current="$1"
+  local ips=""
+  for n in $(other_nodes "$current"); do
+    local ip
+    ip=$(yb_exec "$n" "hostname -i 2>/dev/null | awk '{print \$1}'" 2>/dev/null || true)
+    [ -n "$ip" ] && ips="$ips $ip"
+  done
+  echo "$ips" | xargs
+}
+
+# 获取本节点 IP
+node_ip() {
+  yb_exec "$1" "hostname -i 2>/dev/null | awk '{print \$1}'" 2>/dev/null || echo "?"
+}
+
+# 检查 ysql/postgres 是否在接受连接
+node_ysql_ready() {
+  local node="$1"
+  local pg_isready=""
+  for p in "/home/yugabyte/postgres/bin/pg_isready" "postgres/bin/pg_isready" "pg_isready"; do
+    yb_exec "$node" "test -x $p" 2>/dev/null && { pg_isready="$p"; break; }
+  done
+  [ -z "$pg_isready" ] && return 1
+  yb_exec "$node" "$pg_isready -h $node -p 5433 2>/dev/null | grep -q 'accepting'" 2>/dev/null && return 0
+  yb_exec "$node" "$pg_isready -h localhost -p 5433 2>/dev/null | grep -q 'accepting'" 2>/dev/null && return 0
+  return 1
+}
+
+# 确保 iptables 可用
+ensure_iptables() {
+  local node="$1"
+  if ! yb_exec "$node" "command -v iptables &>/dev/null"; then
+    echo "  -> Installing iptables in $(resolve_node_name "$node")..."
+    # yb image 基于 almalinux/fedora
+    yb_exec "$node" "dnf install -y -q iptables-legacy 2>/dev/null || dnf install -y -q iptables 2>/dev/null" || {
+      echo "  ERROR: Cannot install iptables in $node"
+      return 1
+    }
+    # 切换到 legacy 模式 (容器内更稳定)
+    yb_exec "$node" "update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null" || true
+    echo "  done"
+  fi
+}
+
+# 记录规则到状态文件
+save_state() {
+  local node="$1"; shift
+  local rule="$*"
+  mkdir -p "$(dirname "$STATE_FILE")"
+  echo "$node|$rule" >> "$STATE_FILE"
+}
+
+# 清除状态文件中的某节点规则
+clear_node_state() {
+  local node="$1"
+  [ -f "$STATE_FILE" ] && sed -i "/^${node}|/d" "$STATE_FILE" 2>/dev/null || true
+}
+
+# 完全清除状态文件
+clear_all_state() {
+  rm -f "$STATE_FILE"
+}
+
+# 读状态文件
+dump_state() {
+  [ -f "$STATE_FILE" ] && cat "$STATE_FILE" || true
+}
+
+# 获取 yb 的 master leader 节点
+get_master_leader() {
+  local node="${NODES[0]}"
+  node_is_running "$node" || return 1
+  yb_exec "$node" "yb-admin -master_addresses ${node}:7100 get_universe_config 2>/dev/null | head -1" >/dev/null 2>&1 || return 1
+  # fallback: 从 yb_servers() 判断
+  yb_exec "$node" "ysqlsh -h $node -tAc \"
+    SELECT host FROM yb_servers() WHERE is_leader = true LIMIT 1;
+  \"" 2>/dev/null || echo "?"
+}
+
+# ==================== 状态命令 ====================
+
+cmd_status() {
+  echo ""
+  echo "╔══════════════════════════════════════════════╗"
+  echo "║     YugabyteDB Chaos Status                 ║"
+  echo "╚══════════════════════════════════════════════╝"
+
+  for node in "${NODES[@]}"; do
+    if ! node_is_running "$node"; then
+      echo "  $(resolve_node_name "$node") ($node)  [STOPPED]"
+      continue
+    fi
+
+    local ip
+    ip=$(node_ip "$node")
+    echo ""
+    echo "─── $(resolve_node_name "$node") [$node] ($ip) ───"
+
+    # iptables rules
+    if yb_exec "$node" "command -v iptables &>/dev/null"; then
+      local drop_input drop_output drop_count
+      drop_input=$(yb_exec "$node" "iptables -L INPUT -n 2>/dev/null | grep -c 'DROP' 2>/dev/null || true")
+      drop_output=$(yb_exec "$node" "iptables -L OUTPUT -n 2>/dev/null | grep -c 'DROP' 2>/dev/null || true")
+      drop_count=$(( ${drop_input:-0} + ${drop_output:-0} ))
+      if [ "$drop_count" -gt 0 ]; then
+        echo "  ⚠ Network: ISOLATED ($drop_count DROP rules)"
+        yb_exec "$node" "iptables -L OUTPUT -n 2>/dev/null | grep DROP" | while IFS= read -r line; do
+          [ -n "$line" ] && echo "     OUTPUT: $line"
+        done
+        yb_exec "$node" "iptables -L INPUT -n 2>/dev/null | grep DROP" | while IFS= read -r line; do
+          [ -n "$line" ] && echo "     INPUT:  $line"
+        done
+      else
+        echo "  ✓ Network: connected"
+      fi
+    fi
+
+    # tc qdisc
+    if yb_exec "$node" "command -v tc &>/dev/null"; then
+      local tc_line
+      tc_line=$(yb_exec "$node" "tc qdisc show dev eth0 2>/dev/null | grep netem | head -1" || true)
+      if [ -n "$tc_line" ]; then
+        local delay_info
+        delay_info=$(echo "$tc_line" | grep -oE 'delay [0-9.]+ms' || echo "active")
+        local loss_info
+        loss_info=$(echo "$tc_line" | grep -oE 'loss [0-9.]+%' || true)
+        echo "  ⚠ Delay: $delay_info $loss_info"
+      else
+        echo "  ✓ Delay: none"
+      fi
+    fi
+
+    # YB processes
+    local master running
+    master=$(yb_exec "$node" "pgrep yb-master 2>/dev/null" || true)
+    running=$(yb_exec "$node" "pgrep yb-tserver 2>/dev/null" || true)
+    [ -n "$master" ] && echo "  ✓ yb-master: running" || echo "  ✗ yb-master: stopped"
+    [ -n "$running" ] && echo "  ✓ yb-tserver: running" || echo "  ✗ yb-tserver: stopped"
+    node_ysql_ready "$node" && echo "  ✓ ysql: accepting" || echo "  ✗ ysql: not accepting"
+  done
+
+  # 集群概要
+  echo ""
+  echo "─── Cluster ───"
+  # 找一个健康的节点查询
+  local healthy=""
+  for n in "${NODES[@]}"; do
+    if node_ysql_ready "$n"; then
+      healthy="$n"
+      break
+    fi
+  done
+  if [ -n "$healthy" ]; then
+    local node_info
+    node_info=$(yb_exec "$healthy" "ysqlsh -h $healthy -tAc \"SELECT count(*) || ' nodes' FROM yb_servers();\"" 2>/dev/null || echo "?")
+    echo "  $node_info"
+  else
+    echo "  (no healthy node)"
+  fi
+  echo ""
+}
+
+# ==================== 分区命令 ====================
+
+# 在节点上添加 iptables DROP 规则
+_add_drop_rules() {
+  local node="$1"
+  local direction="$2"   # INPUT or OUTPUT
+  local ips="$3"
+
+  ensure_iptables "$node"
+
+  for ip in $ips; do
+    if yb_exec "$node" "iptables -C $direction -d $ip -j DROP 2>/dev/null; iptables -C $direction -s $ip -j DROP 2>/dev/null"; then
+      # 规则已存在
+      true
+    else
+      case "$direction" in
+        OUTPUT) yb_exec "$node" "iptables -A OUTPUT -d $ip -j DROP" ;;
+        INPUT)  yb_exec "$node" "iptables -A INPUT -s $ip -j DROP" ;;
+      esac
+      save_state "$node" "$direction $ip"
+    fi
+  done
+}
+
+_remove_drop_rules() {
+  local node="$1"
+  local direction="$2"
+  local ips="$3"
+
+  for ip in $ips; do
+    case "$direction" in
+      OUTPUT) yb_exec "$node" "iptables -D OUTPUT -d $ip -j DROP 2>/dev/null" || true ;;
+      INPUT)  yb_exec "$node" "iptables -D INPUT -s $ip -j DROP 2>/dev/null" || true ;;
+    esac
+  done
+}
+
+_flush_all_rules() {
+  local node="$1"
+  yb_exec "$node" "iptables -F 2>/dev/null; iptables -X 2>/dev/null" || true
+}
+
+cmd_partition_isolate() {
+  local target="$1"
+  local mode="${2:-full}"
+  local node
+  node=$(resolve_node "$target")
+  [ -z "$node" ] && { echo "ERROR: Unknown node: $target (use yb-1/region1/yb-compose-yb-1)"; return 1; }
+  ! node_is_running "$node" && { echo "ERROR: $node is not running"; return 1; }
+
+  local other_ips
+  other_ips=$(other_node_ips "$node")
+  [ -z "$other_ips" ] && { echo "ERROR: Cannot resolve peer IPs"; return 1; }
+
+  local name
+  name=$(resolve_node_name "$node")
+
+  case "$mode" in
+    full)
+      echo ">>> Isolating $name [$node] ..."
+      _add_drop_rules "$node" "OUTPUT" "$other_ips"
+      _add_drop_rules "$node" "INPUT"  "$other_ips"
+      echo "  $name is now FULLY ISOLATED (OUTPUT+INPUT dropped)"
+      ;;
+    input-only)
+      echo ">>> Input-isolating $name [$node] ..."
+      _add_drop_rules "$node" "INPUT" "$other_ips"
+      echo "  $name: can send, cannot receive (INPUT dropped)"
+      ;;
+    output-only)
+      echo ">>> Output-isolating $name [$node] ..."
+      _add_drop_rules "$node" "OUTPUT" "$other_ips"
+      echo "  $name: can receive, cannot send (OUTPUT dropped)"
+      ;;
+    *)
+      echo "ERROR: Unknown mode: $mode (full|input-only|output-only)"
+      return 1
+      ;;
+  esac
+}
+
+cmd_partition_heal() {
+  local target="${1:-all}"
+
+  if [ "$target" = "all" ]; then
+    echo ">>> Healing all nodes..."
+    for n in "${NODES[@]}"; do
+      node_is_running "$n" && _flush_all_rules "$n"
+    done
+    clear_all_state
+    echo "  All nodes: network restored"
+    return 0
+  fi
+
+  local node
+  node=$(resolve_node "$target")
+  [ -z "$node" ] && { echo "ERROR: Unknown node: $target"; return 1; }
+  ! node_is_running "$node" && { echo "ERROR: $node is not running"; return 1; }
+
+  local name
+  name=$(resolve_node_name "$node")
+  echo ">>> Healing $name [$node] ..."
+  _flush_all_rules "$node"
+  clear_node_state "$node"
+  echo "  $name: network restored"
+}
+
+# ==================== 延迟命令 ====================
+
+cmd_delay_set() {
+  local target="$1"
+  local delay_ms="${2:-30}"
+  local jitter="${3:-}"
+  local loss="${4:-}"
+
+  local node
+  node=$(resolve_node "$target")
+  [ -z "$node" ] && { echo "ERROR: Unknown node: $target"; return 1; }
+  ! node_is_running "$node" && { echo "ERROR: $node is not running"; return 1; }
+
+  local name
+  name=$(resolve_node_name "$node")
+
+  # 清除旧的 qdisc (如果有)
+  yb_exec "$node" "tc qdisc del dev eth0 root 2>/dev/null" || true
+
+  # 构建 netem 参数
+  local netem_args="delay ${delay_ms}ms"
+  [ -n "$jitter" ] && netem_args="$netem_args ${jitter}ms"
+  [ -n "$loss" ]   && netem_args="$netem_args loss ${loss}%"
+
+  echo ">>> Setting delay on $name [$node]: $netem_args"
+  yb_exec "$node" "tc qdisc add dev eth0 root netem $netem_args"
+  save_state "$node" "DELAY $netem_args"
+  echo "  done"
+}
+
+cmd_delay_clear() {
+  local target="${1:-all}"
+
+  if [ "$target" = "all" ]; then
+    echo ">>> Clearing delay on all nodes..."
+    for n in "${NODES[@]}"; do
+      node_is_running "$n" && yb_exec "$n" "tc qdisc del dev eth0 root 2>/dev/null" || true
+    done
+    echo "  done"
+    return 0
+  fi
+
+  local node
+  node=$(resolve_node "$target")
+  [ -z "$node" ] && { echo "ERROR: Unknown node: $target"; return 1; }
+
+  local name
+  name=$(resolve_node_name "$node")
+  echo ">>> Clearing delay on $name [$node] ..."
+  yb_exec "$node" "tc qdisc del dev eth0 root 2>/dev/null" || true
+  echo "  done"
+}
+
+# ==================== 场景命令 ====================
+
+scenario_network_partition() {
+  local target="${1:-region1}"
+  local duration="${2:-20}"
+
+  local node
+  node=$(resolve_node "$target")
+  [ -z "$node" ] && { echo "ERROR: Unknown node: $target"; return 1; }
+
+  echo ""
+  echo "▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓"
+  echo "  Scenario: NETWORK PARTITION"
+  echo "  Target:   $(resolve_node_name "$node") ($node)"
+  echo "  Duration: ${duration}s"
+  echo "  Action:   Full isolation (iptables DROP)"
+  echo "▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓"
+  echo ""
+
+  # 记录隔离前的 leader 分布
+  echo "--- Before partition ---"
+  local leader_node="${NODES[0]}"
+  if node_is_running "$leader_node"; then
+    docker compose exec -T yb ysqlsh -h "$leader_node" -tAc "
+      SELECT host, CASE WHEN is_leader THEN 'LEADER' ELSE 'follower' END FROM yb_servers() ORDER BY host;
+    " 2>/dev/null || echo "  (unreachable)"
+  fi
+  echo ""
+
+  # 执行隔离
+  cmd_partition_isolate "$node" "full"
+  echo ""
+  echo "  Node isolated. Watching for leader re-election..."
+  echo "  (waiting ${duration}s...)"
+  echo ""
+
+  # 等待期间每 5s 检查一次集群状态
+  for i in $(seq 1 $((duration / 5))); do
+    sleep 5
+    local remaining=$((duration - i * 5))
+    echo "  [t=${i}s] Remaining: ${remaining}s"
+    if node_is_running "$leader_node"; then
+      docker compose exec -T yb ysqlsh -h "$leader_node" -tAc "
+        SELECT host, CASE WHEN is_leader THEN 'LEADER' ELSE 'follower' END FROM yb_servers() ORDER BY host;
+      " 2>/dev/null || echo "  (master unreachable)"
+    fi
+  done
+
+  # 剩余等待时间
+  if [ $((duration % 5)) -gt 0 ]; then
+    sleep $((duration % 5))
+  fi
+
+  # 恢复
+  echo ""
+  echo "--- Healing ---"
+  cmd_partition_heal "$node"
+
+  echo ""
+  echo "--- After heal ---"
+  sleep 3
+  if node_is_running "$leader_node"; then
+    docker compose exec -T yb ysqlsh -h "$leader_node" -tAc "
+      SELECT host, CASE WHEN is_leader THEN 'LEADER' ELSE 'follower' END FROM yb_servers() ORDER BY host;
+    " 2>/dev/null || echo "  (unreachable)"
+  fi
+  echo ""
+  echo "Scenario complete."
+}
+
+scenario_asymmetric_delay() {
+  echo ""
+  echo "▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓"
+  echo "  Scenario: ASYMMETRIC DELAY"
+  echo "  Effect:   Each node gets different latency"
+  echo "  region1=10ms, region2=50ms, region3=100ms"
+  echo "▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓"
+  echo ""
+
+  cmd_delay_set "region1" "10"
+  cmd_delay_set "region2" "50"
+  cmd_delay_set "region3" "100"
+
+  echo ""
+  echo "=== Delay distribution ==="
+  for n in "${NODES[@]}"; do
+    local delay_info
+    delay_info=$(yb_exec "$n" "tc qdisc show dev eth0 2>/dev/null | grep -oP 'delay [\d.]+ms' || echo 'none'" 2>/dev/null)
+    echo "  $(resolve_node_name "$n"): $delay_info"
+  done
+  echo ""
+  echo "Scenario active. Run 'chaosctl delay clear --all' to restore."
+}
+
+scenario_cascading_failure() {
+  local duration="${1:-15}"
+
+  echo ""
+  echo "▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓"
+  echo "  Scenario: CASCADING FAILURE"
+  echo "  t=0    Isolate region1"
+  echo "  t=+${duration}s  Isolate region2 (cluster degraded)"
+  echo "  t=+$((duration*2))s  Heal all"
+  echo "▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓"
+  echo ""
+
+  # Phase 1: 隔离 region1
+  echo "=== Phase 1: Isolate region1 ==="
+  cmd_partition_isolate "region1" "full"
+  echo ""
+
+  echo "Waiting ${duration}s..."
+  sleep "$duration"
+
+  # Phase 2: 隔离 region2 (只剩 region3)
+  echo ""
+  echo "=== Phase 2: Isolate region2 (仅剩 region3) ==="
+  cmd_partition_isolate "region2" "full"
+  echo ""
+
+  # 检查集群是否还能工作
+  echo "  Checking cluster availability..."
+  local leader_node="${NODES[0]}"
+  if node_is_running "$leader_node"; then
+    docker compose exec -T yb ysqlsh -h "$leader_node" -tAc "SELECT 1;" 2>/dev/null \
+      && echo "  ✓ region3 (via yb-1) still available" \
+      || echo "  ✗ cluster unavailable"
+  fi
+  echo ""
+
+  echo "Waiting ${duration}s..."
+  sleep "$duration"
+
+  # Phase 3: 恢复全部
+  echo ""
+  echo "=== Phase 3: Heal all ==="
+  cmd_partition_heal "all"
+
+  echo ""
+  echo "Scenario complete. Cluster should be recovering."
+}
+
+cmd_scenario_list() {
+  echo "Available scenarios:"
+  echo ""
+  echo "  network-partition [node=duration=20]"
+  echo "    Isolate a node from the cluster for N seconds, then heal."
+  echo "    Observe Raft leader re-election and cluster recovery."
+  echo ""
+  echo "  asymmetric-delay"
+  echo "    Set different delays on each node (10/50/100ms)."
+  echo "    Observe leader preference and read latency distribution."
+  echo ""
+  echo "  cascading-failure [duration=15]"
+  echo "    Sequentially isolate region1, then region2."
+  echo "    Test cluster survivability with 1/3 nodes."
+  echo ""
+}
+
+cmd_scenario_run() {
+  local name="$1"
+  shift || true
+
+  case "$name" in
+    network-partition) scenario_network_partition "$@" ;;
+    asymmetric-delay)  scenario_asymmetric_delay "$@" ;;
+    cascading-failure) scenario_cascading_failure "$@" ;;
+    *)
+      echo "ERROR: Unknown scenario: $name"
+      cmd_scenario_list
+      return 1
+      ;;
+  esac
+}
+
+# ==================== 帮助 ====================
+
+cmd_help() {
+  echo ""
+  echo "chaosctl v${VERSION} - YugabyteDB 混沌工程控制器"
+  echo ""
+  echo "用法:"
+  echo "  chaosctl <command> [args]"
+  echo ""
+  echo "节点:"
+  echo "  支持 yb-1 / region1 / yb-compose-yb-1 三种写法"
+  echo ""
+  echo "命令:"
+  echo "  status                              查看集群网络与混沌状态"
+  echo ""
+  echo "  网络分区:"
+  echo "  partition isolate <node>             完全隔离节点 (双向DROP)"
+  echo "  partition isolate-input <node>       只能发不能收"
+  echo "  partition isolate-output <node>      只能收不能发"
+  echo "  partition heal [node]                恢复节点 (不指定=全部)"
+  echo ""
+  echo "  延迟注入:"
+  echo "  delay set <node> <ms> [jitter] [loss%]"
+  echo "  delay clear [node]"
+  echo ""
+  echo "  预设场景:"
+  echo "  scenario list                        列出预设场景"
+  echo "  scenario run <name> [args]           运行预设场景"
+  echo ""
+  echo "示例:"
+  echo "  chaosctl status"
+  echo "  chaosctl partition isolate yb-1"
+  echo "  chaosctl partition heal region1"
+  echo "  chaosctl delay set region2 50 5 1"
+  echo "  chaosctl scenario run network-partition yb-1 30"
+  echo "  chaosctl scenario run cascading-failure"
+  echo ""
+}
+
+# ==================== 主入口 ====================
+
+main() {
+  [ $# -eq 0 ] && { cmd_help; exit 0; }
+
+  local cmd="$1"; shift
+
+  case "$cmd" in
+    status)   cmd_status ;;
+    partition)
+      local sub="${1:-help}"; shift || true
+      case "$sub" in
+        isolate)        cmd_partition_isolate "${1:?Usage: partition isolate <node>}" "full" ;;
+        isolate-input)  cmd_partition_isolate "${1:?Usage: partition isolate-input <node>}" "input-only" ;;
+        isolate-output) cmd_partition_isolate "${1:?Usage: partition isolate-output <node>}" "output-only" ;;
+        heal)           cmd_partition_heal "${1:-all}" ;;
+        *)              echo "Usage: partition {isolate|isolate-input|isolate-output|heal} [args]" ;;
+      esac
+      ;;
+    delay)
+      local sub="${1:-help}"; shift || true
+      case "$sub" in
+        set)   cmd_delay_set "${1:?Usage: delay set <node> <ms> [jitter] [loss%]}" "${2:-30}" "${3:-}" "${4:-}" ;;
+        clear) cmd_delay_clear "${1:-all}" ;;
+        *)     echo "Usage: delay {set|clear} [args]" ;;
+      esac
+      ;;
+    scenario)
+      local sub="${1:-help}"; shift || true
+      case "$sub" in
+        list) cmd_scenario_list ;;
+        run)  cmd_scenario_run "${1:?Usage: scenario run <name>}" ;;
+        *)    echo "Usage: scenario {list|run} [args]" ;;
+      esac
+      ;;
+    help|--help|-h) cmd_help ;;
+    *)  echo "ERROR: Unknown command: $cmd"; cmd_help; exit 1 ;;
+  esac
+}
+
+main "$@"
