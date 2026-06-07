@@ -48,6 +48,24 @@ make experiment-all        # 自动依次执行全部实验
 | 所需镜像 | 自动拉取: yugabytedb/yugabyte, caddy:2-alpine, alpine:latest |
 | 本地构建 | `yb-compose-chaosctl` (make chaos-build) |
 
+## 在容器内运行实验（可选）
+
+不想在宿主机装依赖？可以直接在 Docker 容器内跑实验：
+
+```bash
+# 一键复现全部实验（容器内自动安装 make + python3）
+docker compose -f docker-compose.dev.yaml run --rm yblab make experiment-all
+
+# 运行单项实验
+docker compose -f docker-compose.dev.yaml run --rm yblab make experiment-wan
+docker compose -f docker-compose.dev.yaml run --rm yblab make experiment-failover-docker
+
+# 进入交互式 Shell（调试用）
+docker compose -f docker-compose.dev.yaml run --rm yblab bash
+```
+
+原理：将宿主机的 Docker socket (`/var/run/docker.sock`) 挂载到容器内，容器中的 docker CLI 直接操作宿主机的 Docker 守护进程，相当于在宿主机上运行。无需嵌套 Docker 或特权模式。
+
 ---
 
 ## 实验操作指南

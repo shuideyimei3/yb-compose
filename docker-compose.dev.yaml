@@ -1,0 +1,26 @@
+# Dev Container — 在容器内运行全部实验
+# =====================================
+# 将 Docker socket 挂载到容器中，使容器内的 docker CLI
+# 直接操作宿主机的 Docker 守护进程，无需嵌套 Docker。
+#
+# 用法:
+#   docker compose -f docker-compose.dev.yaml run --rm yblab make experiment-all
+#   docker compose -f docker-compose.dev.yaml run --rm yblab make experiment-wan
+#   docker compose -f docker-compose.dev.yaml run --rm yblab bash
+
+services:
+  yblab:
+    image: docker:cli
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    # entrypoint 安装 make/python 后，执行 run 传入的命令
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        apk add --no-cache make python3 py3-pip >/dev/null 2>&1
+        exec "$$0" "$$@"
