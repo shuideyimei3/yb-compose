@@ -57,9 +57,11 @@
 
 1. 客户端连接到 yb-2，但 yb-2 被隔离无法与其他节点通信
 2. perf_test 表的 tablet leader 可能在 yb-2 上
-3. 客户端尝试从 yb-2 读取 → tablet leader 不可达 → 等待 Raft leader 切换
-4. leader 切换需要 heartbeat timeout + election timeout ≈ **数秒到数十秒**
-5. 在延迟环境下（60ms egress on yb-2），leader detection 更慢
+3. 客户端尝试从 yb-2 读取 → tablet leader 不可达 → **客户端 TCP 连接超时**
+4. **关键**: 33s 延迟主要来自 **TCP 连接超时**，而非 Raft leader 切换。Raft election 通常在 500ms-3s 内完成，但 iptables DROP 不发送 TCP RST，客户端 TCP 连接会保持 SYN_SENT 状态直到操作系统默认超时（Linux 默认 30s+）
+5. 客户端在 yb-2 上的连接一直等待（无响应，非拒绝），直到 TCP 超时后才尝试其他路由
+
+> **为什么不是 Raft leader 切换时间**: Raft heartbeat timeout 默认 ~300ms，leader election ~200-300ms，总计 <1s。33s 远超过这个范围，说明瓶颈在客户端连接层而非共识协议层。
 
 ### 3.2 后续读取延迟反而更低 (56-98ms)
 

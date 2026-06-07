@@ -56,7 +56,14 @@
 - YugabyteDB 的 Raft 通信依赖 TCP，丢包导致 Raft round trip 超时
 - P99 遭遇丢包的概率 ≈ 1 - (1-0.02)^30 ≈ 45%（30 次迭代中有 1 次丢包的概率很高）
 
-**5% 丢包（region3）** 看似影响较小（P99 ×2.1），但这是因为 avg 被严重拉高（203ms），使 P99/avg 比值看起来不大。实际上 P99 = 249ms 仍然很高，且 avg 被丢包重传严重拉偏。
+**5% 丢包（region3）** 看似影响较小（P99 ×2.1），但这是因为 avg 被严重拉高（~167ms），使 P99/avg 比值看起来不大。实际上 P99 = 249ms 仍然很高，且 avg 被丢包重传严重拉偏。
+
+**关于 region2 (2% loss) avg 高于 region3 (5% loss) 的反直觉现象**：region2 的读 avg（203.16ms）反而高于 region3（167.40ms），这与"丢包越多延迟越高"的直觉相悖。可能原因：
+1. **Tablet leader 分布差异**：perf_test 表的 tablet leader 恰好位于 region2 上，所有读取请求都路由到 region2 的 tablet leader，经过 2% loss × jitter 的链路；而 region3 的读取通过跨节点 Raft 可以走更稳定的链路（依赖其他节点的 leader）
+2. **测试时序问题**：jitter+loss 和 bandwidth 测试分两个阶段运行，中间集群可能发生了变化（tablet leader 重分配），导致前后条件不完全一致
+3. **Raft 共识路径**：如果 tablet leader 在 region2，则写请求也必须经过 region2 完成 Raft 共识，2% loss 比 5% loss 对 leader 的直接影响更大
+
+**更深入的分析**：region2 的 P99 极高（1,217ms）说明 TCP 重传在 2% loss 下触发了严重的尾部延迟，即使 avg 看起来正常。而 region3 的 P99（250ms）相对稳定，说明 5% loss 下反而没有触发相同程度的尾部放大（可能因为 tablet leader 在更低延迟的节点上，共识路径避开了高丢包节点）。
 
 ### 3.2 Jitter 的影响
 

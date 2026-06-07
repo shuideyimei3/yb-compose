@@ -34,6 +34,8 @@
 | 恢复后集群 | 5 节点全部可见 |
 | RPO | 0（Raft 保证已提交日志不丢失） |
 
+> **与 README 的差异**: README 预期 docker stop RTO 为 ~515ms，实测为 586.55ms，差异约 70ms，在正常波动范围内。
+
 ### 2.2 iptables 网络分区
 
 | 指标 | 结果 |
@@ -46,6 +48,8 @@
 
 **RTO (total)** = 从故障注入到写入恢复的总时间
 **RTO (net)** = 从分区生效到写入恢复的时间（扣除 chaosctl 启动开销）
+
+> **与 README 的差异**: README 预期 iptables RTO 为 ~1000-1500ms，但实测 RTO (net) 为 561ms，与 docker stop 接近。README 的 ~1000-1500ms 可能是包含了 chaosctl 工具启动时间的总 RTO（实测 total = 2,602ms），也可能是早期粗略估计，建议更新为实测值。
 
 ---
 

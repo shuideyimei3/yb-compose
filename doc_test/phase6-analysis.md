@@ -35,6 +35,8 @@
 
 **关键发现**: Master Leader 在 **region2 (25ms)**，而非延迟最低的 **region1 (10ms)**。
 
+> **与 README 预期的差异**: README 中实验 6 的预期输出为"Master leader → region1 (10ms, 最低延迟节点) ✅ 自动选择"，但实测结果与此不符——Raft 并不自动选择最低延迟节点作为 leader。README 需要更新以反映实际行为。
+
 ### 2.2 Tablet Leader 分布
 
 无法通过 `yb-admin list_tablets` 获取 perf_test 表的 tablet leader 分布（命令超时），但这本身说明了非均匀延迟下管理操作的性能退化。

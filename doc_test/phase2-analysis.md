@@ -75,6 +75,8 @@
 - **YugabyteDB SQL 层处理**：YSQL（PostgreSQL 兼容层）解析和执行约 20-30ms
 - **Raft 共识**在基准环境下开销极小（同主机 RTT <1ms）
 
+> **与 README 预期的差异**: README 中实验 2 的预期读 avg 为 ~49ms（"所有节点 ~50ms，主要来自 Docker 网络栈 + psql 连接建立开销"），而实测值为 64-68ms（均值 ~65.66ms），差距约 15ms。这可能是由于 perf_test 表的 schema 差异（BIGSERIAL PK + TEXT + TIMESTAMPTZ vs 更简单的表结构）、数据量不同（10,000 行 vs 更少）、以及测试脚本版本不同导致的连接建立开销变化。
+
 ### 3.2 读写延迟差异
 
 读写延迟几乎相同（avg 差异 <3ms），原因：
