@@ -37,13 +37,13 @@ SELECT val FROM consistency_probe WHERE id = 1;
 echo ""
 echo "=== 4. 写后读一致性验证 ==="
 UNIQUE_VAL=$RANDOM
-docker compose exec -T yb ysqlsh -h "$HOST" -c \
+docker compose exec -T yb-1 ysqlsh -h yb-1 -h "$HOST" -c \
   "INSERT INTO consistency_probe (id, val) VALUES ($UNIQUE_VAL, $UNIQUE_VAL) ON CONFLICT (id) DO UPDATE SET val = $UNIQUE_VAL;"
 echo "Written value: $UNIQUE_VAL"
 
 for setting in "yb_read_from_followers=off" "yb_read_from_followers=on"; do
-  READ_VAL=$(docker compose exec -T yb ysqlsh -h "$HOST" -tAc \
-    "SET $setting; SELECT val FROM consistency_probe WHERE id = $UNIQUE_VAL;")
+  READ_VAL=$(docker compose exec -T yb-1 ysqlsh -h yb-1 -tAc \
+    "SET $setting; SELECT val FROM consistency_probe WHERE id = $UNIQUE_VAL;" 2>/dev/null | tail -1)
   if [ "$READ_VAL" = "$UNIQUE_VAL" ]; then
     echo "  $setting => $READ_VAL ✓"
   else
@@ -58,7 +58,7 @@ echo "========================================="
 
 echo ""
 echo "=== 5. 创建账户表 ==="
-docker compose exec -T yb ysqlsh -h "$HOST" -c "
+docker compose exec -T yb-1 ysqlsh -h yb-1 -h "$HOST" -c "
 CREATE TABLE IF NOT EXISTS accounts (
   id INT PRIMARY KEY,
   balance NUMERIC DEFAULT 0,

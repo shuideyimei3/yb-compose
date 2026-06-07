@@ -11,13 +11,17 @@ REPO_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$REPO_DIR"
 
 DELAY_MODE=false
+PERSIST=false
 if [ "${1:-}" = "--delay" ]; then
   DELAY_MODE=true
+fi
+if [ "${PERSIST:-}" = "true" ]; then
+  PERSIST=true
 fi
 
 echo "============================================"
 echo " YugabyteDB 测评实验"
-echo " Mode: $([ "$DELAY_MODE" = true ] && echo 'DELAY (30ms/zone)' || echo 'BASELINE (no delay)')"
+echo " Mode: $([ "$DELAY_MODE" = true ] && echo 'DELAY (30ms/zone)' || echo 'BASELINE (no delay)')  Persist: $PERSIST"
 echo "============================================"
 
 # ----- Phase 1: 环境搭建 -----
@@ -101,7 +105,11 @@ bash "$SCRIPT_DIR/01-setup-perf-test.sh"
 
 echo ""
 echo ">>> Phase 3.1: 延迟对比实验"
-python3 "$SCRIPT_DIR/02-latency-bench.py" --iter 30
+if [ "$PERSIST" = true ]; then
+  python3 "$SCRIPT_DIR/02-latency-bench-persist.py" --iter 30
+else
+  python3 "$SCRIPT_DIR/02-latency-bench.py" --iter 30
+fi
 
 echo ""
 echo ">>> Phase 3.3: 一致性与正确性验证"

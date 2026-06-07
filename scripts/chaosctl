@@ -512,6 +512,64 @@ scenario_asymmetric_delay() {
   echo "Scenario active. Run 'chaosctl delay clear --all' to restore."
 }
 
+scenario_flapping_node() {
+  local target="${1:-region2}"
+  local cycles="${2:-12}"
+  local interval="${3:-5}"
+
+  local node
+  node=$(resolve_node "$target")
+  [ -z "$node" ] && { echo "ERROR: Unknown node: $target"; return 1; }
+  ! node_is_running "$node" && { echo "ERROR: $node is not running"; return 1; }
+
+  local name
+  name=$(resolve_node_name "$node")
+  local total_duration=$((cycles * interval * 2))
+
+  echo ""
+  echo "▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓"
+  echo "  Scenario: FLAPPING NODE"
+  echo "  Target:   $name ($node)"
+  echo "  Cycles:   $cycles"
+  echo "  Interval: ${interval}s per half-cycle"
+  echo "  Total:    ${total_duration}s ($cycles × ${interval}s × 2)"
+  echo "  Pattern:  isolate → wait ${interval}s → heal → wait ${interval}s"
+  echo "▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓"
+  echo ""
+
+  local start_time
+  start_time=$(date +%s)
+
+  for i in $(seq 1 "$cycles"); do
+    local ts
+    ts=$(date '+%H:%M:%S')
+
+    # Isolate phase
+    echo "  [cycle $i/$cycles] [$ts] ISOLATING $name ..."
+    cmd_partition_isolate "$target" "full" 2>/dev/null
+    sleep "$interval"
+
+    # Heal phase
+    ts=$(date '+%H:%M:%S')
+    echo "  [cycle $i/$cycles] [$ts] HEALING $name ..."
+    cmd_partition_heal "$target" 2>/dev/null
+    sleep "$interval"
+  done
+
+  local end_time elapsed
+  end_time=$(date +%s)
+  elapsed=$((end_time - start_time))
+
+  echo ""
+  echo "▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓"
+  echo "  Flapping node scenario COMPLETE"
+  echo "  Target:      $name"
+  echo "  Cycles:      $cycles"
+  echo "  Total time:  ${elapsed}s"
+  echo "▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓"
+  echo ""
+}
+
 scenario_cascading_failure() {
   local duration="${1:-15}"
 
@@ -575,6 +633,11 @@ cmd_scenario_list() {
   echo "    Sequentially isolate region1, then region2."
   echo "    Test cluster survivability with 1/3 nodes."
   echo ""
+  echo "  flapping-node [node=region2] [cycles=12] [interval=5]"
+  echo "    Repeatedly isolate and heal a node in cycles."
+  echo "    Each cycle: isolate → wait interval → heal → wait interval."
+  echo "    Test cluster resilience under intermittent network partitions."
+  echo ""
 }
 
 cmd_scenario_run() {
@@ -585,6 +648,7 @@ cmd_scenario_run() {
     network-partition) scenario_network_partition "$@" ;;
     asymmetric-delay)  scenario_asymmetric_delay "$@" ;;
     cascading-failure) scenario_cascading_failure "$@" ;;
+    flapping-node)     scenario_flapping_node "$@" ;;
     *)
       echo "ERROR: Unknown scenario: $name"
       cmd_scenario_list

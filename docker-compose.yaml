@@ -27,6 +27,7 @@ services:
       - 9042
     cap_add:
       - NET_ADMIN
+      - SYS_TIME
     ports:
       - "5433:5433"
       - "9042:9042"
