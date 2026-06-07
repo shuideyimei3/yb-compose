@@ -37,11 +37,11 @@ services:
       timeout: 3s
       test: postgres/bin/pg_isready -h $$(hostname)
   expose:
-   - "7000:7000"
-   - "9000:9000"
-   - "5433:5433"
-   - "9042:9042"
-   - "15433:15433"
+   - 7000
+   - 9000
+   - 5433
+   - 9042
+   - 15433
   ports:
    - "5433-5463:5433"
    - "9042-9072:9042"
@@ -57,7 +57,7 @@ services:
   image: caddy:2-alpine
   command: caddy reverse-proxy --from :7000 --to yb:7000
   ports:
-   - 7000:7000
+   - 7001:7000
  ui-15433:
   image: caddy:2-alpine
   command: caddy reverse-proxy --from :15433 --to yb:15433

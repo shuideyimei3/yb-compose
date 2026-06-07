@@ -1,0 +1,13 @@
+# 自定义 PG 客户端镜像，预装 pgbench 等压测工具
+FROM postgres:16
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    postgresql-contrib-16 \
+    bc \
+    python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY scripts/*.sh /opt/yb-bench/scripts/
+COPY sql/*.sql /opt/yb-bench/sql/
+
+ENTRYPOINT ["/bin/bash", "-c", "while true; do sleep 3600; done"]
