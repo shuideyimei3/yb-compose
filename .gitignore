@@ -12,3 +12,6 @@ logs/
 
 # Docker
 docker-compose.override.yaml
+
+# Pre-cloned go-tpc source for Docker build
+.go-tpc-src/

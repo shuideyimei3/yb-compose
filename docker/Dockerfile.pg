@@ -10,4 +10,4 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY scripts/*.sh /opt/yb-bench/scripts/
 COPY sql/*.sql /opt/yb-bench/sql/
 
-ENTRYPOINT ["/bin/bash", "-c", "while true; do sleep 3600; done"]
+ENTRYPOINT ["/bin/bash", "-c"]

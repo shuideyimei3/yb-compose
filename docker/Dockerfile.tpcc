@@ -1,5 +1,7 @@
 # TPC-C benchmark image with go-tpc for YugabyteDB YSQL
 # Build: docker build -f Dockerfile.tpcc -t yb-tpcc:latest .
+# Note: go-tpc source must be available at ../.go-tpc-src/ (pre-cloned on host
+# to work around Docker Desktop TLS fragmentation with GitHub)
 
 # Stage 1: Build go-tpc from source
 FROM golang:1.25-alpine AS builder
@@ -8,7 +10,7 @@ FROM golang:1.25-alpine AS builder
 RUN apk update && apk add --no-cache ca-certificates && update-ca-certificates && \
     for i in 1 2 3; do apk add --no-cache git make && break || sleep 3; done
 
-RUN git clone --depth 1 https://github.com/pingcap/go-tpc.git /workspace
+COPY .go-tpc-src /workspace
 WORKDIR /workspace
 
 # Use Go module proxy + retry for network resilience

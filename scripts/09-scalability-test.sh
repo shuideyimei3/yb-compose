@@ -16,10 +16,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 # ── Configuration ─────────────────────────────────────────────────────
-NODE_COUNTS=(1 3 5)
+NODE_COUNTS=(5 3 1)
 PG_CLIENTS=16          # pgbench concurrent clients
 PG_DURATION=60         # pgbench duration per test (seconds)
-PG_SCALE=20            # pgbench scale factor
+PG_SCALE=10            # pgbench scale factor
 
 # ── Results storage ───────────────────────────────────────────────────
 declare -A TPS_RESULTS
@@ -43,7 +43,7 @@ echo ""
 
 # ── Build bench image once ───────────────────────────────────────────
 echo "=== Building bench image (pgbench) ==="
-docker compose -f compose/base.yaml -f compose/bench.yaml build pg 2>&1 | tail -3
+docker compose -p yb-compose -f compose/base.yaml -f compose/bench.yaml build pg 2>&1 | tail -3
 echo ""
 
 # ── Iterate over node counts ──────────────────────────────────────────
@@ -56,7 +56,7 @@ for N in "${NODE_COUNTS[@]}"; do
 
   # ── Clean up any previous run ─────────────────────────────────────
   echo "  Cleaning up previous environment..."
-  docker compose -f compose/base.yaml down -v 2>/dev/null || true
+  docker compose -p yb-compose -f compose/base.yaml down -v 2>/dev/null || true
   sleep 3
 
   # ── Build node list ────────────────────────────────────────────────
@@ -66,7 +66,7 @@ for N in "${NODE_COUNTS[@]}"; do
   done
   # trim leading space
   NODE_LIST="${NODE_LIST# }"
-  COMPOSE="docker compose -f compose/base.yaml"
+  COMPOSE="docker compose -p yb-compose -f compose/base.yaml"
   echo "  Starting nodes: $NODE_LIST"
 
   # ── Start N nodes ──────────────────────────────────────────────────
@@ -78,7 +78,7 @@ for N in "${NODE_COUNTS[@]}"; do
   for try in $(seq 1 120); do
     ready_count=0
     for i in $(seq 1 "$N"); do
-      if docker compose exec -T "yb-$i" bash -c 'postgres/bin/pg_isready -h $(hostname) -p 5433' 2>/dev/null; then
+      if docker compose -p yb-compose exec -T "yb-$i" bash -c 'postgres/bin/pg_isready -h $(hostname) -p 5433' 2>/dev/null; then
         ready_count=$((ready_count + 1))
       fi
     done
@@ -99,7 +99,7 @@ for N in "${NODE_COUNTS[@]}"; do
   echo "  Waiting for YB-Master to register all nodes..."
   sleep 5
   for try in $(seq 1 30); do
-    registered=$(docker compose exec -T yb-1 ysqlsh -h yb-1 -tAc \
+    registered=$(docker compose -p yb-compose exec -T yb-1 ysqlsh -h yb-1 -tAc \
       "SELECT count(*) FROM yb_servers();" 2>/dev/null || echo "0")
     registered=$(echo "$registered" | tr -d '[:space:]')
     if [ "$registered" -ge "$N" ]; then
@@ -111,13 +111,13 @@ for N in "${NODE_COUNTS[@]}"; do
 
   # ── Show cluster topology ──────────────────────────────────────────
   echo "  Cluster topology:"
-  docker compose exec -T yb-1 ysqlsh -h yb-1 -c \
+  docker compose -p yb-compose exec -T yb-1 ysqlsh -h yb-1 -c \
     "SELECT host, cloud, region, zone, node_type FROM yb_servers() ORDER BY host;" 2>/dev/null || true
   echo ""
 
   # ── Initialize pgbench ─────────────────────────────────────────────
   echo "  Initializing pgbench (scale=$PG_SCALE)..."
-  docker compose -f compose/base.yaml -f compose/bench.yaml run --rm -T pg bash -c "
+  docker compose -p yb-compose -f compose/base.yaml -f compose/bench.yaml run --rm -T pg "
     export PGHOST=yb-1 PGPORT=5433 PGUSER=yugabyte PGDATABASE=yugabyte PGPASSWORD=yugabyte
     dropdb --if-exists pgbench 2>/dev/null
     createdb pgbench 2>/dev/null
@@ -127,7 +127,7 @@ for N in "${NODE_COUNTS[@]}"; do
 
   # ── Run pgbench throughput test ────────────────────────────────────
   echo "  Running pgbench ($PG_CLIENTS clients, ${PG_DURATION}s)..."
-  BENCH_OUTPUT=$(docker compose -f compose/base.yaml -f compose/bench.yaml run --rm -T pg bash -c "
+  BENCH_OUTPUT=$(docker compose -p yb-compose -f compose/base.yaml -f compose/bench.yaml run --rm -T pg "
     export PGHOST=yb-1 PGPORT=5433 PGUSER=yugabyte PGDATABASE=pgbench PGPASSWORD=yugabyte
     pgbench -c $PG_CLIENTS -j $PG_CLIENTS -T $PG_DURATION pgbench
   " 2>&1)
@@ -148,7 +148,7 @@ done
 
 # ── Final cleanup ─────────────────────────────────────────────────────
 echo "=== Cleaning up ==="
-docker compose -f compose/base.yaml down -v 2>/dev/null || true
+docker compose -p yb-compose -f compose/base.yaml down -v 2>/dev/null || true
 sleep 2
 
 # ── Summary ──────────────────────────────────────────────────────────

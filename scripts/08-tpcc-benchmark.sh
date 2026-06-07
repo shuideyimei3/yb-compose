@@ -29,7 +29,7 @@ red()   { echo -e "\033[31m$*\033[0m"; }
 green() { echo -e "\033[32m$*\033[0m"; }
 bold()  { echo -e "\033[1m$*\033[0m"; }
 
-TPCC_RUN="docker compose -f compose/base.yaml -f compose/tpcc.yaml run --rm -T tpcc"
+TPCC_RUN="docker compose -p yb-compose -f compose/base.yaml -f compose/tpcc.yaml run --rm -T tpcc"
 
 echo ""
 echo "╔══════════════════════════════════════════════════════════╗"
@@ -48,12 +48,12 @@ cd "$PROJECT_ROOT"
 
 # ── Step 1: Build image if needed ─────────────────────────────────────
 echo "=== Step 1: Build TPC-C image ==="
-docker compose -f compose/base.yaml -f compose/tpcc.yaml build tpcc 2>&1 | tail -3
+docker compose -p yb-compose -f compose/base.yaml -f compose/tpcc.yaml build tpcc 2>&1 | tail -3
 echo ""
 
 # ── Step 2: Create tpcc database ──────────────────────────────────────
 echo "=== Step 2: Create database '$DB' ==="
-docker compose exec -T yb-1 ysqlsh -h "$HOST" -U "$USER" \
+docker compose -p yb-compose exec -T yb-1 ysqlsh -h "$HOST" -U "$USER" \
   -c "CREATE DATABASE $DB;" 2>/dev/null && echo "  Database '$DB' created" || echo "  Database '$DB' already exists"
 echo ""
 
@@ -110,7 +110,7 @@ echo "=== Step 6: Cleanup TPC-C data ==="
 $TPCC_RUN go-tpc tpcc --warehouses "$WAREHOUSES" cleanup \
   -d postgres -U "$USER" -p "$PASS" -D "$DB" \
   -H "$HOST" -P "$PORT" --conn-params sslmode=disable 2>/dev/null || true
-docker compose exec -T yb-1 ysqlsh -h "$HOST" -U "$USER" \
+docker compose -p yb-compose exec -T yb-1 ysqlsh -h "$HOST" -U "$USER" \
   -c "DROP DATABASE IF EXISTS $DB;" 2>/dev/null || true
 echo ""
 
