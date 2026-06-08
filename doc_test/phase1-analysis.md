@@ -1,131 +1,52 @@
 # 实验 1: 环境搭建与架构分析
 
-> **测试日期**: 2026-06-07
-> **环境**: 5 节点 YugabyteDB RF=3（Docker Compose 单主机部署）
-> **配置**: NET_DELAY_MS=1（基准环境，无额外延迟）
+> 核心对应 `doc/architecture.md`: 整体架构、时钟同步机制、共识协议、数据分区与就近读。
 
----
+## 数据来源
 
-## 1. 实验设计
+三次完整复现均通过：
 
-### 1.1 目的
+| Run ID | 状态 | experiment-01 耗时 |
+|---|---:|---:|
+| `20260608T082336Z` | PASS | 3s |
+| `20260608T085229Z` | PASS | 3s |
+| `20260608T093857Z` | PASS | 4s |
 
-验证 5 节点 RF=3 集群的基础架构：
-- HLC（Hybrid Logical Clock）时钟同步
-- Raft 共识拓扑
-- Geo-Partitioning 表空间配置
+## 实验目的
 
-### 1.2 集群拓扑
+验证 YugabyteDB 作为全球分布式数据库原型时的基础结构是否满足后续测试前提：
 
-| 节点 | Host ID | Region | 角色 |
-|------|---------|--------|------|
-| yb-1 | 05c582e3f247 | region1 | Master Leader + TServer |
-| yb-2 | 9f6f0d9baec5 | region2 | Master Follower + TServer |
-| yb-3 | 8b1a35ff63a4 | region3 | Master Follower + TServer |
-| yb-4 | bc736ac87a7d | region4 | TServer only |
-| yb-5 | 28e22e067069 | region5 | TServer only |
+- 5 节点 YSQL 集群可用
+- RF=3 所需的 3 个 Master 和 5 个 TServer 正常
+- HLC 时钟读数单调且集群内可观测
+- region1-region5 表空间可创建，支撑 Geo-Partitioning 分析
 
----
+## 三次复现结果
 
-## 2. 结果
+| 指标 | Run 1 | Run 2 | Run 3 | 结论 |
+|---|---:|---:|---:|---|
+| 可见节点数 | 5 | 5 | 5 | 稳定 |
+| Master daemons | 3 | 3 | 3 | 满足 RF=3 元数据 quorum |
+| TServer daemons | 5 | 5 | 5 | 满足 5 region 模拟 |
+| `now()` 漂移 | 0.000ms | 0.000ms | 0.000ms | 同主机 Docker 共享系统时钟 |
+| region 表空间 | 5 | 5 | 5 | Geo-Partitioning 前提成立 |
 
-### 2.1 HLC 时钟同步
+三次 Master Leader 均位于 region1 对应容器，但容器 ID 每次不同：
 
-```
-     host     |         current_time          
---------------+-------------------------------
- 05c582e3f247 | 2026-06-07 13:08:44.968966+00
- 28e22e067069 | 2026-06-07 13:08:44.968966+00
- 8b1a35ff63a4 | 2026-06-07 13:08:44.968966+00
- 9f6f0d9baec5 | 2026-06-07 13:08:44.968966+00
- bc736ac87a7d | 2026-06-07 13:08:44.968966+00
-```
+| Run ID | Master Leader |
+|---|---|
+| `20260608T082336Z` | `aa16b92c7f7c:7100` |
+| `20260608T085229Z` | `cdc9bbb2c374:7100` |
+| `20260608T093857Z` | `0fbb7ab48f1f:7100` |
 
-**所有 5 个节点的 `now()` 完全一致**（精确到微秒）。这验证了 HLC 在同主机部署下的行为，但需要注意：
+## 架构分析
 
-> **重要说明**: 此完全一致性是因为所有节点运行在同一 Docker 宿主机上，共享同一系统时钟。HLC 本身并不保证跨物理主机的微秒级同步——在真实跨 region 部署中，各节点物理时钟存在 NTP 同步误差（通常 <500ms），HLC 通过逻辑时钟保证单调递增，但 `now()` 不会完全一致。
+YugabyteDB 使用 HLC 而不是 Spanner 的 TrueTime。三次测试中 `now()` 漂移为 0ms，主要原因是所有容器运行在同一宿主机，并不代表真实跨地域物理时钟可以做到微秒级一致。该结果只能说明测试环境下没有额外物理时钟误差，后续时钟偏移实验需要主动注入偏差。
 
-### 2.2 Raft 共识拓扑
+Raft 拓扑稳定为 3 Master + 5 TServer。Master 管理元数据和 tablet 分配，TServer 承载数据读写。RF=3 意味着写入需要多数派确认，这是后续延迟、故障切换、扩展性测试的核心性能开销来源。
 
-```
-     host     | node_type | cloud | region  
---------------+-----------+-------+---------
- 05c582e3f247 | primary   | cloud | region1
- 9f6f0d9baec5 | primary   | cloud | region2
- 8b1a35ff63a4 | primary   | cloud | region3
- bc736ac87a7d | primary   | cloud | region4
- 28e22e067069 | primary   | cloud | region5
-```
+region1-region5 表空间均创建成功，说明可以在 YSQL 层表达 region 维度的数据放置约束。后续实验并未完整展开业务级 geo-partitioned schema，而是重点验证网络延迟、Raft 共识和故障行为。
 
-- 5 个节点均为 `primary` 类型
-- Master Leader 位于 region1（通过 API 确认）
-- 3 个 Master（1 Leader + 2 Follower）分布在 region1/2/3
-- 2 个纯 TServer 在 region4/5
+## 结论
 
-### 2.3 Geo-Partitioning 表空间
-
-```
- spcname 
----------
- region1
- region2
- region3
- region4
- region5
-```
-
-5 个 region 表空间全部创建成功，每个表空间配置了 `replica_placement` 约束，将副本固定到对应 region。
-
----
-
-## 3. 分析
-
-### 3.1 HLC 时钟同步机制
-
-YugabyteDB 使用 HLC（Hybrid Logical Clock）而非 Spanner 的 TrueTime：
-
-| 维度 | HLC | TrueTime |
-|------|-----|----------|
-| 硬件依赖 | 无 | GPS + 原子钟 |
-| 时钟精度 | 逻辑单调递增 | ±ε 不确定性窗口 |
-| Commit Wait | 无需 | 2×ε (1-7ms) |
-| 跨 region | 依赖 NTP 同步 | 依赖专用硬件 |
-
-在同主机部署下，所有节点共享同一物理时钟，HLC 的 `physical` 组件完全一致，`logical` 组件通过 Raft 通信自动递增，因此 `now()` 输出完全相同。
-
-**注意**: 在真实跨 region 部署中，各节点物理时钟存在 NTP 同步误差（通常 <500ms），HLC 通过逻辑时钟保证单调递增，但 `now()` 不会完全一致。
-
-### 3.2 Raft 拓扑结构
-
-```
-Master Quorum (3 节点):
-  region1 (Leader) ←→ region2 (Follower) ←→ region3 (Follower)
-
-TServer 集群 (5 节点):
-  region1, region2, region3, region4, region5
-  RF=3: 每个 tablet 有 3 个副本，分布在 3 个不同 region
-```
-
-- Master 负责元数据管理和协调 tablet 分配
-- TServer 负责实际数据存储和 SQL 查询处理
-- RF=3 意味着每个 tablet 的 3 个副本中，任意 2 个存活即可提供服务
-
-### 3.3 Geo-Partitioning 的意义
-
-创建 region-specific 表空间后，可以将表或分区绑定到特定 region，实现：
-- **数据本地化**: 某些数据只存储在特定 region 的节点上
-- **合规要求**: 数据不出特定地理区域
-- **延迟优化**: 本地读取避免跨 region 通信
-
----
-
-## 4. 结论
-
-| 验证项 | 结果 |
-|--------|------|
-| 5 节点集群启动 | ✅ 全部 healthy |
-| HLC 时钟同步 | ✅ 所有节点 now() 完全一致 |
-| Raft 拓扑 | ✅ 3 Masters (1L+2F) + 5 TServers |
-| Geo-Partitioning | ✅ 5 个 region 表空间创建成功 |
-
-集群基础架构验证通过，可进行后续实验。
+基础架构三次复现稳定。该环境适合作为全球分布式数据库的单机模拟平台，但必须明确局限：它模拟的是多 region 拓扑和网络条件，不是真实多物理地域硬件环境。后续所有延迟和吞吐结论都应在这个前提下解释。

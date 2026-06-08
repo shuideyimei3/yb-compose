@@ -69,7 +69,11 @@ echo ""
 # Step 2: Build TPC-C image
 # ============================================================
 echo "=== Step 2: 构建 TPC-C 镜像 ==="
-docker compose -p yb-compose -f compose/base.yaml -f compose/tpcc.yaml build tpcc 2>&1 | tail -3
+if [ "${FORCE_TPCC_BUILD:-0}" = "1" ] || ! docker image inspect yb-tpcc:latest >/dev/null 2>&1; then
+    docker compose -p yb-compose -f compose/base.yaml -f compose/tpcc.yaml build tpcc 2>&1 | tail -20
+else
+    echo "  复用已有镜像 yb-tpcc:latest (设置 FORCE_TPCC_BUILD=1 可强制重建)"
+fi
 green "  镜像就绪"
 echo ""
 

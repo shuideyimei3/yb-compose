@@ -10,6 +10,9 @@ __pycache__/
 log
 logs/
 
+# Experiment run artifacts
+results/runs/
+
 # Docker
 docker-compose.override.yaml
 

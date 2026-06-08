@@ -18,6 +18,7 @@ LATENCY_ITER ?= 50
 
 .PHONY: up up-delay status psql clean fix-delay
 .PHONY: experiment-all experiment-01 experiment-02 experiment-03 experiment-04 experiment-05 experiment-06 experiment-07 experiment-08 experiment-09 experiment-10 experiment-11
+.PHONY: results-all results-summary
 .PHONY: chaos-build chaos chaos-status chaos-partition chaos-heal chaos-delay chaos-scenario
 .PHONY: build-bench build-tpcc
 
@@ -29,12 +30,12 @@ COMPOSE = docker compose -p yb-compose -f compose/base.yaml
 
 up:
 	$(COMPOSE) up -d yb-1 yb-2 yb-3 yb-4 yb-5 ui-7000 ui-15433 rfNready
-	@timeout 240s bash -c 'until $(COMPOSE) exec -T yb-1 ysqlsh -h yb-1 -tAc "SELECT count(*) FROM yb_servers();" 2>/dev/null | grep -q "^5$$"; do sleep 3; done'
+	@scripts/wait-for-cluster.sh "$(COMPOSE)" yb-1 5 240
 	$(COMPOSE) exec -T yb-1 ysqlsh -h yb-1 -c "SELECT host, cloud, region, zone FROM yb_servers() ORDER BY host;"
 
 up-delay:
 	$(COMPOSE) --env-file=.env.delay up -d yb-1 yb-2 yb-3 yb-4 yb-5 ui-7000 ui-15433 rfNready
-	@timeout 240s bash -c 'until $(COMPOSE) --env-file=.env.delay exec -T yb-1 ysqlsh -h yb-1 -tAc "SELECT count(*) FROM yb_servers();" 2>/dev/null | grep -q "^5$$"; do sleep 3; done'
+	@scripts/wait-for-cluster.sh "$(COMPOSE) --env-file=.env.delay" yb-1 5 240
 	$(MAKE) fix-delay
 
 # 修复/重设延迟注入（容器启动后安装 iproute-tc + 配 tc netem）
@@ -126,6 +127,17 @@ experiment-10:
 
 experiment-11:
 	bash scripts/experiment-11-scalability.sh
+
+results-all: chaos-build
+	RUN_ID="$${RUN_ID:-$$(date -u +%Y%m%dT%H%M%SZ)}" scripts/run-experiment.sh \
+		experiment-01 experiment-02 clean \
+		experiment-03 experiment-04 experiment-05 experiment-06 experiment-07 clean \
+		experiment-08 clean \
+		experiment-09 experiment-10 experiment-11
+
+results-summary:
+	@test -n "$(RUN_DIR)" || { echo "Usage: make results-summary RUN_DIR=results/runs/<run_id>"; exit 64; }
+	scripts/summarize-results.sh "$(RUN_DIR)"
 
 # ============================================================================
 # 压测工具构建

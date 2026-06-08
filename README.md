@@ -330,6 +330,28 @@ PG_DURATION=15 NODE_COUNTS="1 3" bash scripts/experiment-11-scalability.sh
 
 **一键全跑**: `make experiment-all`（约 45-60min）
 
+## 结构化结果
+
+推荐使用结构化入口复现实验，运行日志和元数据会写入 `results/runs/<run_id>/`：
+
+```bash
+make results-all
+```
+
+输出内容：
+- `metadata.json`: target、开始/结束时间、耗时、退出码、git commit
+- `output.log`: 完整终端输出
+- `git-status.txt`: 运行时工作区状态
+- `summary.md`: 自动汇总表
+
+重新生成汇总：
+
+```bash
+make results-summary RUN_DIR=results/runs/20260608T120000Z
+```
+
+`results/runs/` 默认不提交到 Git，避免把大日志和机器相关结果混进代码提交。
+
 ## Makefile 命令参考
 
 | 命令 | 作用 |
